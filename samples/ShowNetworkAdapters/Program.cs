@@ -2,9 +2,11 @@
 using Microsoft.Windows.ComputeVirtualization;
 using Microsoft.Windows.ComputeVirtualization.Schema;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -17,7 +19,7 @@ namespace ShowNetworkAdapters
 
             //This command is what will be run inside the container, to demonstrate the network and file system
             //isolation:
-            var command = @"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe Get-NetAdapter";
+            var command = "cmd.exe /k \"ipconfig /all & dir c:\\\"";
 
             //This is the base image for the file system that the container uses:
             var imageTag = "mcr.microsoft.com/dotnet/framework/runtime:4.8";
@@ -25,25 +27,29 @@ namespace ShowNetworkAdapters
                    .CreateClient();
 
             //Each container image has layers, which represent changes between 
-            //image versions. This reads the image configuration to get all these layers
-            //needed for starting the container.
+            //image versions. This reads the image configuration to get the base layer:
             var imageInfo = await client.Images.InspectImageAsync(imageTag);
 
             var baseImageDir = imageInfo.GraphDriver.Data["dir"];
             var layerConfigText = File.ReadAllText($"{baseImageDir}\\layerchain.json");
-            dynamic layerConfig = JsonConvert.DeserializeObject(layerConfigText);
+            var layerArray = JsonConvert.DeserializeObject<List<string>>(layerConfigText);
 
-            var layers = new List<Layer>();
+            var parentLayer = layerArray.Last();
 
-            foreach (string layer in layerConfig)
+            if (parentLayer == null)
             {
-                layers.Add(
-                    new Layer
-                    {
-                        Id = Guid.NewGuid(),
-                        Path = layer
-                    });
+                Console.WriteLine("No parent layer found.");
+                return;
             }
+
+            var containerLayers = new[]
+            { 
+                new Layer
+                {
+                    Id = Guid.NewGuid(),
+                    Path = parentLayer.ToString()
+                }
+            };
 
             //This generates a unique ID for the container we're creating:
             var newContainerId = Guid.NewGuid();
@@ -51,7 +57,7 @@ namespace ShowNetworkAdapters
             //This is the temporary local isolated sandbox for the container's filesystem:
             var newSandboxPath = $"c:\\testfiles\\sandbox\\{newContainerId}";
 
-            ContainerStorage.CreateSandbox(newSandboxPath, layers);
+            ContainerStorage.CreateSandbox(newSandboxPath, containerLayers);
 
             //Windows containers use Hyper-V virtual switches, this gets the
             //ID of the one we want to connect the container to:
@@ -63,13 +69,13 @@ namespace ShowNetworkAdapters
                 var cs = new ContainerSettings
                 {
                     SandboxPath = newSandboxPath,
-                    Layers = layers,
+                    Layers = containerLayers,
                     KillOnClose = true,
                     NetworkId = virtualNetId,
                 };
                 using (var container = HostComputeService.CreateContainer(newContainerId.ToString(), cs))
                 {
-                    Console.Out.WriteLine("Starting container...");
+                    Console.Out.WriteLine($"Starting container {newContainerId}...");
                     Console.Out.Flush();
                     container.Start();
                     try
@@ -102,6 +108,8 @@ namespace ShowNetworkAdapters
                 ContainerStorage.DestroyLayer(newSandboxPath);
             }
 
+            Console.WriteLine("Container stopped.");
+            Console.ReadLine();
         }
     }
 }
